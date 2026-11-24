@@ -24,19 +24,23 @@ jobs:
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-      # The guest payloads take about an hour to build. Key the caches on every tracked path except
-      # .github, so a workflow-only fix reuses them and any source change rebuilds them.
-      - name: Compute source key
+      # The guest payloads take about half an hour to build. Key the caches on the only top-level
+      # paths that feed them (see guest/*/input-fingerprint.sh), so macOS-side and workflow-only
+      # changes reuse them. The restore-keys entries are the caches of the first run, built from
+      # the same guest inputs under the earlier whole-tree key.
+      - name: Compute guest source key
         id: src
         run: |
           set -euo pipefail
-          key="$(git ls-tree HEAD | awk -F'\t' '$2 != ".github"' | sha256sum | cut -c1-40)"
+          key="$(git ls-tree HEAD -- guest dory-core patches rust-toolchain.toml .cargo | sha256sum | cut -c1-40)"
           echo "key=$key" >> "$GITHUB_OUTPUT"
       - name: Restore cached kernels
         id: kernels
         uses: actions/cache/restore@v4
         with:
-          key: fork-dev-kernels-arm64-${{ steps.src.outputs.key }}
+          key: fork-dev-kernels-arm64-v2-${{ steps.src.outputs.key }}
+          restore-keys: |
+            fork-dev-kernels-arm64-862de5628b7793a2d10606d9c9d36603f594ea00
           path: |
             guest/out/Image
             guest/out/config-arm64
@@ -48,11 +52,29 @@ jobs:
         id: initfs
         uses: actions/cache/restore@v4
         with:
-          key: fork-dev-initfs-arm64-${{ steps.src.outputs.key }}
+          key: fork-dev-initfs-arm64-v2-${{ steps.src.outputs.key }}
+          restore-keys: |
+            fork-dev-initfs-arm64-862de5628b7793a2d10606d9c9d36603f594ea00
           path: |
             guest/out/initfs-arm64.ext4
             guest/out/dory-agent-arm64
             guest/out/initfs-build-arm64.stamp
+      # cache-hit is true only for an exact key match, so decide from the files themselves.
+      - name: Check which payloads were restored
+        id: have
+        run: |
+          kernels=false; initfs=false
+          if [ -s guest/out/Image ] && [ -s guest/out/Image-gpu ] \
+            && [ -s guest/out/kernel-build-arm64.stamp ] && [ -s guest/out/kernel-build-arm64-gpu.stamp ]; then
+            kernels=true
+          fi
+          if [ -s guest/out/initfs-arm64.ext4 ] && [ -s guest/out/dory-agent-arm64 ] \
+            && [ -s guest/out/initfs-build-arm64.stamp ]; then
+            initfs=true
+          fi
+          echo "kernels=$kernels" >> "$GITHUB_OUTPUT"
+          echo "initfs=$initfs" >> "$GITHUB_OUTPUT"
+          echo "restored: kernels=$kernels initfs=$initfs"
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
       - name: Install guest build prerequisites
         run: sudo apt-get update && sudo apt-get install -y binutils-aarch64-linux-gnu e2fsprogs file patchelf protobuf-compiler zstd
@@ -65,7 +87,7 @@ jobs:
           ln -sf "$rust_lld" "$RUNNER_TEMP/rust-lld-bin/rust-lld"
           echo "$RUNNER_TEMP/rust-lld-bin" >> "$GITHUB_PATH"
       - name: Build and verify kernels
-        if: steps.kernels.outputs.cache-hit != 'true'
+        if: steps.have.outputs.kernels != 'true'
         run: |
           set -euo pipefail
           DORY_EXPERIMENTAL_GPU=0 guest/kernel/build.sh arm64
@@ -76,7 +98,7 @@ jobs:
         if: steps.kernels.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          key: fork-dev-kernels-arm64-${{ steps.src.outputs.key }}
+          key: fork-dev-kernels-arm64-v2-${{ steps.src.outputs.key }}
           path: |
             guest/out/Image
             guest/out/config-arm64
@@ -85,7 +107,7 @@ jobs:
             guest/out/config-arm64-gpu
             guest/out/kernel-build-arm64-gpu.stamp
       - name: Build and verify engine rootfs and agent
-        if: steps.initfs.outputs.cache-hit != 'true'
+        if: steps.have.outputs.initfs != 'true'
         run: |
           set -euo pipefail
           guest/initfs/build.sh arm64
@@ -94,7 +116,7 @@ jobs:
         if: steps.initfs.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          key: fork-dev-initfs-arm64-${{ steps.src.outputs.key }}
+          key: fork-dev-initfs-arm64-v2-${{ steps.src.outputs.key }}
           path: |
             guest/out/initfs-arm64.ext4
             guest/out/dory-agent-arm64
