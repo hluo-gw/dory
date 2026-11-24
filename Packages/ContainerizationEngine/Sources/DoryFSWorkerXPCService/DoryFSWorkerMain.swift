@@ -112,10 +112,10 @@ private final class DoryFSWorkerListenerDelegate:
     NSXPCListenerDelegate,
     @unchecked Sendable
 {
-    private static let runnerSigningRequirement = """
-        anchor apple generic and identifier "com.pythonxi.Dory.HVRunner" and \
-        certificate leaf[subject.OU] = "864H636QW4"
-        """
+    // Team-bound in a signed build; identifier-only when this worker itself is ad-hoc signed.
+    private static let runnerSigningRequirement = DoryFSWorkerPeerSigningPolicy.requirement(
+        peerIdentifier: DoryFSWorkerPeerSigningPolicy.runnerIdentifier
+    )
 
     private let admissionLock = NSLock()
     private var adapter: DoryFSWorkerXPCAdapter?

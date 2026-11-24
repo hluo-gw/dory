@@ -21,8 +21,10 @@ public final class DoryFSWorkerXPCChannel:
     DoryFSWorkerChannel,
     @unchecked Sendable
 {
-    private static let workerCodeSigningRequirement =
-        #"anchor apple generic and identifier "com.pythonxi.Dory.HVRunner.FSWorker" and certificate leaf[subject.OU] = "864H636QW4""#
+    // Team-bound in a signed build; identifier-only when this runner itself is ad-hoc signed.
+    private static let workerCodeSigningRequirement = DoryFSWorkerPeerSigningPolicy.requirement(
+        peerIdentifier: DoryFSWorkerPeerSigningPolicy.workerIdentifier
+    )
 
     private enum State {
         case active
