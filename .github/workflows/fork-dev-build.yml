@@ -1,0 +1,192 @@
+name: Fork dev build (unsigned)
+
+# Builds an ad-hoc signed development Dory.app from this branch on GitHub-hosted runners and
+# uploads it as a workflow artifact. This is NOT a release: it is not Developer ID signed, not
+# notarized, and skips every release qualification gate. The release workflows stay bound to the
+# maintainer's self-hosted Macs and signing secrets and cannot run in a fork.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['dev/kind_arm64']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-dev-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guest-arm64:
+    name: Build arm64 Linux guest (kernels, engine rootfs, agent)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      # The guest payloads take about an hour to build. Key the caches on every tracked path except
+      # .github, so a workflow-only fix reuses them and any source change rebuilds them.
+      - name: Compute source key
+        id: src
+        run: |
+          set -euo pipefail
+          key="$(git ls-tree HEAD | awk -F'\t' '$2 != ".github"' | sha256sum | cut -c1-40)"
+          echo "key=$key" >> "$GITHUB_OUTPUT"
+      - name: Restore cached kernels
+        id: kernels
+        uses: actions/cache/restore@v4
+        with:
+          key: fork-dev-kernels-arm64-${{ steps.src.outputs.key }}
+          path: |
+            guest/out/Image
+            guest/out/config-arm64
+            guest/out/kernel-build-arm64.stamp
+            guest/out/Image-gpu
+            guest/out/config-arm64-gpu
+            guest/out/kernel-build-arm64-gpu.stamp
+      - name: Restore cached engine rootfs and agent
+        id: initfs
+        uses: actions/cache/restore@v4
+        with:
+          key: fork-dev-initfs-arm64-${{ steps.src.outputs.key }}
+          path: |
+            guest/out/initfs-arm64.ext4
+            guest/out/dory-agent-arm64
+            guest/out/initfs-build-arm64.stamp
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - name: Install guest build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y binutils-aarch64-linux-gnu e2fsprogs file patchelf protobuf-compiler zstd
+      - name: Expose rust-lld for the static guest tools
+        run: |
+          set -euo pipefail
+          rust_lld="$(find "$(rustc --print sysroot)/lib/rustlib" -type f -name rust-lld | head -1)"
+          test -x "$rust_lld"
+          mkdir -p "$RUNNER_TEMP/rust-lld-bin"
+          ln -sf "$rust_lld" "$RUNNER_TEMP/rust-lld-bin/rust-lld"
+          echo "$RUNNER_TEMP/rust-lld-bin" >> "$GITHUB_PATH"
+      - name: Build and verify kernels
+        if: steps.kernels.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          DORY_EXPERIMENTAL_GPU=0 guest/kernel/build.sh arm64
+          DORY_EXPERIMENTAL_GPU=1 guest/kernel/build.sh arm64
+          DORY_EXPERIMENTAL_GPU=0 guest/kernel/verify-build.sh arm64
+          DORY_EXPERIMENTAL_GPU=1 guest/kernel/verify-build.sh arm64
+      - name: Save kernels to cache
+        if: steps.kernels.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: fork-dev-kernels-arm64-${{ steps.src.outputs.key }}
+          path: |
+            guest/out/Image
+            guest/out/config-arm64
+            guest/out/kernel-build-arm64.stamp
+            guest/out/Image-gpu
+            guest/out/config-arm64-gpu
+            guest/out/kernel-build-arm64-gpu.stamp
+      - name: Build and verify engine rootfs and agent
+        if: steps.initfs.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          guest/initfs/build.sh arm64
+          guest/initfs/verify-build.sh arm64
+      - name: Save engine rootfs and agent to cache
+        if: steps.initfs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: fork-dev-initfs-arm64-${{ steps.src.outputs.key }}
+          path: |
+            guest/out/initfs-arm64.ext4
+            guest/out/dory-agent-arm64
+            guest/out/initfs-build-arm64.stamp
+      - name: List guest payloads
+        run: ls -la guest/out
+      - name: Upload guest payloads
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fork-dev-guest-arm64-${{ github.sha }}
+          overwrite: true
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            guest/out/Image
+            guest/out/config-arm64
+            guest/out/kernel-build-arm64.stamp
+            guest/out/Image-gpu
+            guest/out/config-arm64-gpu
+            guest/out/kernel-build-arm64-gpu.stamp
+            guest/out/initfs-arm64.ext4
+            guest/out/dory-agent-arm64
+            guest/out/initfs-build-arm64.stamp
+
+  app:
+    name: Build ad-hoc signed Dory.app (Debug, Docker Core)
+    needs: guest-arm64
+    runs-on: macos-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Select Xcode
+        run: |
+          newest="$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)"
+          echo "selected: $newest"
+          echo "DEVELOPER_DIR=$newest/Contents/Developer" >> "$GITHUB_ENV"
+      - name: Download Metal toolchain (Xcode 26 ships without it)
+        run: xcodebuild -downloadComponent MetalToolchain || true
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - name: Install Protocol Buffers compiler
+        run: brew install protobuf
+      - name: Install Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.5'
+      - name: Download same-commit guest payloads
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fork-dev-guest-arm64-${{ github.sha }}
+          path: guest/out
+      - name: Build shared Rust guest-control client
+        run: scripts/build-dory-ffi-xcframework.sh --if-needed
+      - name: Build and bundle the development app
+        env:
+          DORY_XCODE_CONFIGURATION: Debug
+          # Fail the build instead of producing an app that cannot boot its Docker engine.
+          DORY_REQUIRE_CORE_ASSETS: '1'
+        run: |
+          set -euo pipefail
+          chmod 0755 guest/out/dory-agent-arm64
+          scripts/build.sh
+      - name: Show the Xcode log tail on failure
+        if: failure()
+        run: tail -n 300 /tmp/dory_build.log || true
+      - name: Verify and package Dory.app
+        run: |
+          set -euo pipefail
+          app="$(ls -d "$HOME"/Library/Developer/Xcode/DerivedData/Dory-*/Build/Products/Debug/Dory.app | head -1)"
+          test -d "$app"
+          codesign --verify --deep --strict "$app"
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")"
+          build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")"
+          {
+            echo "version=$version"
+            echo "build=$build"
+            echo "commit=$GITHUB_SHA"
+            echo "configuration=Debug"
+            echo "signing=ad-hoc (not notarized)"
+          } | tee "$RUNNER_TEMP/BUILD-INFO.txt"
+          ls -la "$app/Contents/Resources" | grep -E 'dory-(hv-kernel|engine-rootfs|agent)' || true
+          mkdir -p "$RUNNER_TEMP/out"
+          cp "$RUNNER_TEMP/BUILD-INFO.txt" "$RUNNER_TEMP/out/"
+          # ditto keeps symlinks, extended attributes, and the code signature intact.
+          ditto -c -k --keepParent "$app" "$RUNNER_TEMP/out/Dory-dev-$version-${GITHUB_SHA::8}.zip"
+          ls -la "$RUNNER_TEMP/out"
+      - name: Upload Dory.app
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Dory-dev-${{ github.sha }}
+          overwrite: true
+          retention-days: 14
+          if-no-files-found: error
+          compression-level: 0
+          path: ${{ runner.temp }}/out/
